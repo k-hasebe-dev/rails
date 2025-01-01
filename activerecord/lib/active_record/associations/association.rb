@@ -2,9 +2,9 @@
 
 module ActiveRecord
   module Associations
-    # = Active Record Associations
+    # = アクティブレコードのアソシエーション
     #
-    # This is the root class of all associations ('+ Foo' signifies an included module Foo):
+    # これはすべてのアソシエーションのルートクラスです（'+ Foo' は含まれるモジュール Foo を示します）：
     #
     #   Association
     #     SingularAssociation
@@ -16,12 +16,11 @@ module ActiveRecord
     #       HasManyAssociation + ForeignAssociation
     #         HasManyThroughAssociation + ThroughAssociation
     #
-    # Associations in Active Record are middlemen between the object that
-    # holds the association, known as the <tt>owner</tt>, and the associated
-    # result set, known as the <tt>target</tt>. Association metadata is available in
-    # <tt>reflection</tt>, which is an instance of <tt>ActiveRecord::Reflection::AssociationReflection</tt>.
+    # Active Recordにおけるアソシエーションは、アソシエーションを保持するオブジェクト（<tt>owner</tt>と呼ばれる）と
+    # 関連する結果セット（<tt>target</tt>と呼ばれる）との間の仲介役です。アソシエーションのメタデータは
+    # <tt>reflection</tt>に利用可能で、これは+ActiveRecord::Reflection::AssociationReflection+のインスタンスです。
     #
-    # For example, given
+    # 例えば、
     #
     #   class Blog < ActiveRecord::Base
     #     has_many :posts
@@ -29,11 +28,12 @@ module ActiveRecord
     #
     #   blog = Blog.first
     #
-    # The association of <tt>blog.posts</tt> has the object +blog+ as its
-    # <tt>owner</tt>, the collection of its posts as <tt>target</tt>, and
-    # the <tt>reflection</tt> object represents a <tt>:has_many</tt> macro.
-    class Association #:nodoc:
-      attr_reader :owner, :target, :reflection
+    # の場合、<tt>blog.posts</tt>のアソシエーションはオブジェクト+blog+を<tt>owner</tt>として、
+    # そのポストのコレクションを<tt>target</tt>として持ち、<tt>reflection</tt>オブジェクトは
+    # <tt>:has_many</tt>マクロを表します。
+    class Association # :nodoc:
+      attr_accessor :owner
+      attr_reader :reflection, :disable_joins
 
       delegate :options, to: :reflection
 
@@ -41,64 +41,72 @@ module ActiveRecord
         reflection.check_validity!
 
         @owner, @reflection = owner, reflection
+        @disable_joins = @reflection.options[:disable_joins] || false
 
         reset
         reset_scope
+
+        @skip_strict_loading = nil
       end
 
-      # Resets the \loaded flag to +false+ and sets the \target to +nil+.
+      def target
+        if @target.is_a?(Promise)
+          @target = @target.value
+        end
+        @target
+      end
+
+      # \loaded フラグを +false+ にリセットし、\target を +nil+ に設定します。
       def reset
         @loaded = false
-        @target = nil
         @stale_state = nil
-        @inversed = false
       end
 
       def reset_negative_cache # :nodoc:
         reset if loaded? && target.nil?
       end
 
-      # Reloads the \target and returns +self+ on success.
-      # The QueryCache is cleared if +force+ is true.
+      # \target をリロードし、成功したら +self+ を返します。
+      # +force+ が true の場合、クエリキャッシュがクリアされます。
       def reload(force = false)
-        klass.connection.clear_query_cache if force && klass
+        klass.connection_pool.clear_query_cache if force && klass
         reset
         reset_scope
         load_target
         self unless target.nil?
       end
 
-      # Has the \target been already \loaded?
+      # \target がすでに \loaded されていますか？
       def loaded?
         @loaded
       end
 
-      # Asserts the \target has been loaded setting the \loaded flag to +true+.
+      # \target が読み込まれたことを主張し、\loaded フラグを +true+ に設定します。
       def loaded!
         @loaded = true
         @stale_state = stale_state
-        @inversed = false
       end
 
-      # The target is stale if the target no longer points to the record(s) that the
-      # relevant foreign_key(s) refers to. If stale, the association accessor method
-      # on the owner will reload the target. It's up to subclasses to implement the
-      # stale_state method if relevant.
+      # target が関連する foreign_key が指すレコードを指していない場合、target は古いと見なされます。stale の場合、アソシエーションアクセサメソッドは target をリロードします。サブクラスに stale_state メソッドが関連する場合、実装する必要があります。
       #
-      # Note that if the target has not been loaded, it is not considered stale.
+      # target が読み込まれていない場合は、古いと見なされません。
       def stale_target?
-        !@inversed && loaded? && @stale_state != stale_state
+        loaded? && @stale_state != stale_state
       end
 
-      # Sets the target of this association to <tt>\target</tt>, and the \loaded flag to +true+.
+      # このアソシエーションの target を <tt>\target</tt> に設定し、\loaded フラグを +true+ にします。
       def target=(target)
         @target = target
         loaded!
       end
 
       def scope
-        if (scope = klass.current_scope) && scope.try(:proxy_association) == self
+        if disable_joins
+          DisableJoinsAssociationScope.create.scope(self)
+        elsif (scope = klass.current_scope) && scope.try(:proxy_association) == self
           scope.spawn
+        elsif scope = klass.global_current_scope
+          target_scope.merge!(association_scope).merge!(scope)
         else
           target_scope.merge!(association_scope)
         end
@@ -108,7 +116,15 @@ module ActiveRecord
         @association_scope = nil
       end
 
-      # Set the inverse association, if possible
+      def set_strict_loading(record)
+        if owner.strict_loading_n_plus_one_only? && reflection.macro == :has_many
+          record.strict_loading!
+        else
+          record.strict_loading!(false, mode: owner.strict_loading_mode)
+        end
+      end
+
+      # 可能であれば逆アソシエーションを設定します
       def set_inverse_instance(record)
         if inverse = inverse_association_for(record)
           inverse.inversed_from(owner)
@@ -123,7 +139,7 @@ module ActiveRecord
         record
       end
 
-      # Remove the inverse association, if possible
+      # 可能であれば逆アソシエーションを削除します
       def remove_inverse_instance(record)
         if inverse = inverse_association_for(record)
           inverse.inversed_from(nil)
@@ -132,20 +148,15 @@ module ActiveRecord
 
       def inversed_from(record)
         self.target = record
-        @inversed = !!record
       end
 
       def inversed_from_queries(record)
         if inversable?(record)
           self.target = record
-          @inversed = true
-        else
-          @inversed = false
         end
       end
 
-      # Returns the class of the target. belongs_to polymorphic overrides this to look at the
-      # polymorphic_type field on the owner.
+      # target のクラスを返します。belongs_to の polymorphic は所有者の polymorphic_type フィールドを参照してこれを上書きします。
       def klass
         reflection.klass
       end
@@ -160,18 +171,25 @@ module ActiveRecord
         extensions
       end
 
-      # Loads the \target if needed and returns it.
+      # \target を必要に応じてロードし、返します。
       #
-      # This method is abstract in the sense that it relies on +find_target+,
-      # which is expected to be provided by descendants.
+      # このメソッドは +find_target+ に依存しているため、抽象的です。find_target は子クラスによって提供されることが期待されています。
       #
-      # If the \target is already \loaded it is just returned. Thus, you can call
-      # +load_target+ unconditionally to get the \target.
+      # \target がすでに \loaded されている場合は、それを返します。従って、+load_target+ を無条件に呼び出すことで \target を取得できます。
       #
-      # ActiveRecord::RecordNotFound is rescued within the method, and it is
-      # not reraised. The proxy is \reset and +nil+ is the return value.
+      # ActiveRecord::RecordNotFound はメソッド内で救出され、再度投げられることはありません。プロキシは \reset され、返り値は +nil+ です。
       def load_target
-        @target = find_target if (@stale_state && stale_target?) || find_target?
+        @target = find_target(async: false) if (@stale_state && stale_target?) || find_target?
+        if !@target && set_through_target_for_new_record?
+          reflections = reflection.chain
+          reflections.pop
+          reflections.reverse!
+
+          @target = reflections.reduce(through_association.target) do |middle_target, through_reflection|
+            break unless middle_target
+            middle_target.association(through_reflection.source_reflection_name).load_target
+          end
+        end
 
         loaded! unless loaded?
         target
@@ -179,7 +197,14 @@ module ActiveRecord
         reset
       end
 
-      # We can't dump @reflection and @through_reflection since it contains the scope proc
+      def async_load_target # :nodoc:
+        @target = find_target(async: true) if (@stale_state && stale_target?) || find_target?
+
+        loaded! unless loaded?
+        nil
+      end
+
+      # @reflection と @through_reflection はスコーププロックを含むため、ダンプできません
       def marshal_dump
         ivars = (instance_variables - [:@reflection, :@through_reflection]).map { |name| [name, instance_variable_get(name)] }
         [@reflection.name, ivars]
@@ -191,7 +216,7 @@ module ActiveRecord
         @reflection = @owner.class._reflect_on_association(reflection_name)
       end
 
-      def initialize_attributes(record, except_from_scope_attributes = nil) #:nodoc:
+      def initialize_attributes(record, except_from_scope_attributes = nil) # :nodoc:
         except_from_scope_attributes ||= {}
         skip_assign = [reflection.foreign_key, reflection.type].compact
         assigned_keys = record.changed_attribute_names_to_save
@@ -209,14 +234,31 @@ module ActiveRecord
         _create_record(attributes, true, &block)
       end
 
+      # アソシエーションが単一レコードか複数レコードかを返します。
+      def collection?
+        false
+      end
+
       private
-        def find_target
-          if strict_loading? && owner.validation_context.nil?
+        # リーダーとライターは一貫したエラーを表示するためにこれを呼び出します
+        # アソシエーションターゲットクラスが存在しない場合
+        def ensure_klass_exists!
+          klass
+        end
+
+        def find_target(async: false)
+          if violates_strict_loading?
             Base.strict_loading_violation!(owner: owner.class, reflection: reflection)
           end
 
           scope = self.scope
-          return scope.to_a if skip_statement_cache?(scope)
+          if skip_statement_cache?(scope)
+            if async
+              return scope.load_async.then(&:to_a)
+            else
+              return scope.to_a
+            end
+          end
 
           sc = reflection.association_scope_cache(klass, owner) do |params|
             as = AssociationScope.create { params.bind }
@@ -224,29 +266,49 @@ module ActiveRecord
           end
 
           binds = AssociationScope.get_bind_values(owner, reflection.chain)
-          sc.execute(binds, klass.connection) { |record| set_inverse_instance(record) }
-        end
-
-        def strict_loading?
-          return reflection.strict_loading? if reflection.options.key?(:strict_loading)
-
-          owner.strict_loading?
-        end
-
-        # The scope for this association.
-        #
-        # Note that the association_scope is merged into the target_scope only when the
-        # scope method is called. This is because at that point the call may be surrounded
-        # by scope.scoping { ... } or unscoped { ... } etc, which affects the scope which
-        # actually gets built.
-        def association_scope
-          if klass
-            @association_scope ||= AssociationScope.scope(self)
+          klass.with_connection do |c|
+            sc.execute(binds, c, async: async) do |record|
+              set_inverse_instance(record)
+              set_strict_loading(record)
+            end
           end
         end
 
-        # Can be overridden (i.e. in ThroughAssociation) to merge in other scopes (i.e. the
-        # through association's scope)
+        def skip_strict_loading(&block)
+          skip_strict_loading_was = @skip_strict_loading
+          @skip_strict_loading = true
+          yield
+        ensure
+          @skip_strict_loading = skip_strict_loading_was
+        end
+
+        def violates_strict_loading?
+          return if @skip_strict_loading
+
+          return unless owner.validation_context.nil?
+
+          return reflection.strict_loading? if reflection.options.key?(:strict_loading)
+
+          owner.strict_loading? && !owner.strict_loading_n_plus_one_only?
+        end
+
+        # このアソシエーションのスコープ。
+        #
+        # 注意: association_scope は target_scope にのみ結合されます
+        # scope メソッドが呼び出されたときです。これは、呼び出し時に
+        # scope.scoping { ... } や unscoped { ... } といった周りの呼び出しによって
+        # 実際に構築されるスコープに影響を与える可能性があるためです。
+        def association_scope
+          if klass
+            @association_scope ||= if disable_joins
+              DisableJoinsAssociationScope.scope(self)
+            else
+              AssociationScope.scope(self)
+            end
+          end
+        end
+
+        # 他のスコープ（例えば、through アソシエーションのスコープ）をマージするためにオーバーライド可能
         def target_scope
           AssociationRelation.create(klass, self).merge!(klass.scope_for_association)
         end
@@ -259,21 +321,19 @@ module ActiveRecord
           !loaded? && (!owner.new_record? || foreign_key_present?) && klass
         end
 
-        # Returns true if there is a foreign key present on the owner which
-        # references the target. This is used to determine whether we can load
-        # the target if the owner is currently a new record (and therefore
-        # without a key). If the owner is a new record then foreign_key must
-        # be present in order to load target.
-        #
-        # Currently implemented by belongs_to (vanilla and polymorphic) and
-        # has_one/has_many :through associations which go through a belongs_to.
+        def set_through_target_for_new_record?
+          owner.new_record? && reflection.through_reflection? && through_association.target
+        end
+
+        # 所有者に外部キーが存在する場合、target をロードできることを確認します。
+        # これは、所有者が新しいレコードである場合（キーがないために）、外部キーが存在するかどうかで、target をロードできるかどうかを決定するために使用されます。
+        # 現在の実装では belongs_to (通常と polymorphic) および belongs_to を通じた has_one/has_many :through アソシエーションのみで使用されます。
         def foreign_key_present?
           false
         end
 
-        # Raises ActiveRecord::AssociationTypeMismatch unless +record+ is of
-        # the kind of the class of the associated objects. Meant to be used as
-        # a sanity check when you are about to assign an associated record.
+        # +record+ がアソシエーションの対象オブジェクトのクラスのインスタンスでない場合、ActiveRecord::AssociationTypeMismatch を発生させます。
+        # 対象オブジェクトを割り当てる直前に使用する安全チェックとして使用されます。
         def raise_on_type_mismatch!(record)
           unless record.is_a?(reflection.klass)
             fresh_class = reflection.class_name.safe_constantize
@@ -291,29 +351,26 @@ module ActiveRecord
           end
         end
 
-        # Can be redefined by subclasses, notably polymorphic belongs_to
-        # The record parameter is necessary to support polymorphic inverses as we must check for
-        # the association in the specific class of the record.
+        # 与えられた record の逆アソシエーションを設定する必要がある場合に true を返します。
+        # このメソッドはサブクラスによってオーバーライドされます。
         def inverse_reflection_for(record)
           reflection.inverse_of
         end
 
-        # Returns true if inverse association on the given record needs to be set.
-        # This method is redefined by subclasses.
+        # 与えられた record の逆アソシエーションを設定する必要がある場合に true を返します。
+        # このメソッドはサブクラスによってオーバーライドされます。
         def invertible_for?(record)
           foreign_key_for?(record) && inverse_reflection_for(record)
         end
 
-        # Returns true if record contains the foreign_key
+        # record に foreign_key が存在する場合に true を返します。
         def foreign_key_for?(record)
-          record._has_attribute?(reflection.foreign_key)
+          foreign_key = Array(reflection.foreign_key)
+          foreign_key.all? { |key| record._has_attribute?(key) }
         end
 
-        # This should be implemented to return the values of the relevant key(s) on the owner,
-        # so that when stale_state is different from the value stored on the last find_target,
-        # the target is stale.
-        #
-        # This is only relevant to certain associations, which is why it returns +nil+ by default.
+        # 関連 state が古い場合に true を返すメソッドです。
+        # サブクラスで実装する必要があるため、デフォルトでは +nil+ を返します。
         def stale_state
         end
 
@@ -324,7 +381,7 @@ module ActiveRecord
           end
         end
 
-        # Returns true if statement cache should be skipped on the association reader.
+        # アソシエーションリーダーでステートメントキャッシュをスキップする場合は true を返します。
         def skip_statement_cache?(scope)
           reflection.has_scope? ||
             scope.eager_loading? ||
